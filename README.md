@@ -1,6 +1,6 @@
 # ComfyUI-MrWeazNodes
 
-A collection of professional, high-quality custom nodes for ComfyUI, designed by MrWeazel. This pack focuses on enhanced UI experiences, creative image post-processing, and streamlined Flux (Klein) editing workflows.
+A collection of professional, high-quality custom nodes for ComfyUI, designed by MrWeaz. This pack focuses on enhanced UI experiences, creative image post-processing, and streamlined Flux (Klein) editing workflows.
 
 ---
 
@@ -61,4 +61,4 @@ Specially designed nodes for the Flux generation ecosystem.
 
 ---
 
-Developed with ❤️ by **MrWeazel**.
+Developed with ❤️ by **MrWeaz**.
