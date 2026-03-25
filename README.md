@@ -34,6 +34,7 @@ A unified post-processing powerhouse that consolidates dozens of effects into a 
 ## ⚡ Flux Klein QoL Suite
 Specially designed nodes for the Flux generation ecosystem.
 - **(MRW) Advanced Klein Edit**: Loads a source image directly on-node, previews it via outputs, supports optional edit-time downscaling for faster passes, and prepares the same minimal Klein edit conditioning workflow as the original external-image setup, including alpha-mask support when present.
+- **(MRW) Image Reference**: A reference image loader node that automatically passes conditioning and encodes reference as a latent to pass to the Klein Edit node.
 - **(MRW) Prompt Blender**: A dedicated string-building node for organizing subject, action, environment, and style components.
 - **(MRW) Reference Grid Stitcher**: Quickly stitch and arrange reference images horizontally or vertically for comparison.
 - **(MRW) Mask Feather & Expand**: Professional-grade mask post-processing for smooth inpainting transitions.
