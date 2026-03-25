@@ -17,7 +17,8 @@ A state-of-the-art prompt management interface directly inside ComfyUI.
 A high-performance comparison tool for side-by-side or layered evaluation.
 - **Slide Mode**: Interactive vertical slider reveals Image B as you hover over the node.
 - **Click Mode**: Hold the mouse button down to instantly toggle between Image A and B.
-- **Pro Metadata**: Saves both comparison images with full metadata support for future reference.
+- **Advanced Saving**: Optionally save Image A, Image B, and a stitched comparison to custom output subfolders with custom filename prefixes.
+- **Pro Metadata**: Can embed prompt and extra PNG metadata into persistent comparison exports for future reference.
 - **Custom Context Menu**: Easily switch modes or toggle informational labels via right-click.
 
 ### 🪄 (MRW) All-in-One Image Effects
@@ -30,7 +31,7 @@ A unified post-processing powerhouse that consolidates dozens of effects into a 
 
 ## ⚡ Flux Klein QoL Suite
 Specially designed nodes for the Flux generation ecosystem.
-- **(MRW) Klein Quick Edit Ref Loader**: Encodes reference images for precise editing workflows.
+- **(MRW) Advanced Klein Edit**: Loads a source image directly on-node, previews it via outputs, supports optional edit-time downscaling for faster passes, and prepares the same minimal Klein edit conditioning workflow as the original external-image setup, including alpha-mask support when present.
 - **(MRW) Prompt Blender**: A dedicated string-building node for organizing subject, action, environment, and style components.
 - **(MRW) Reference Grid Stitcher**: Quickly stitch and arrange reference images horizontally or vertically for comparison.
 - **(MRW) Mask Feather & Expand**: Professional-grade mask post-processing for smooth inpainting transitions.
