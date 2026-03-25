@@ -12,6 +12,8 @@ A state-of-the-art prompt management interface directly inside ComfyUI.
 - **Presets & Logging**: Save your favorite prompts and view historically used ones with the integrated logger.
 - **Dynamic Data**: Automatically manages local storage for presets in the `data/` folder.
 - **Slick Styling**: Dark-mode optimized with tinted backgrounds for better visual focus.
+- **Easily Load LoRAs & Wildcards**: Load your LoRAs in a single click with auto triggers that attach to the prompt eliminating the need to manually type triggers, also features a wildcard tab to automatically attach wildcards to your prompt, saving you time and workflow space by alot!
+- **Metadata Fetcher**: Grab metadata for LoRAs in one click! In the options tab you will find a button to grab metadata for all of your LoRAs that will safely grab triggers and preview images for your LoRA library from Civit.
 
 ### ⚖️ (MRW) Pro Image Comparer
 A high-performance comparison tool for side-by-side or layered evaluation.
