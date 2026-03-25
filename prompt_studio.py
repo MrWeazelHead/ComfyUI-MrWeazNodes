@@ -20,6 +20,9 @@ import urllib.parse
 # Wildcard System
 # ──────────────────────────────────────────────────────────────
 
+_wildcard_index_cache = None
+_wildcard_index_time = 0
+
 def _get_wildcard_dirs():
     """Return a list of directories to scan for wildcard .txt files."""
     comfyui_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,8 +37,16 @@ def _get_wildcard_dirs():
     ]
     return [d for d in candidates if os.path.isdir(d)]
 
-def _build_wildcard_index():
-    """Build {name: filepath} mapping from all wildcard directories."""
+def _build_wildcard_index(force=False):
+    """Build {name: filepath} mapping from all wildcard directories, with caching."""
+    global _wildcard_index_cache, _wildcard_index_time
+    now = datetime.datetime.now().timestamp()
+    
+    # Cache index for 60 seconds unless forced
+    if not force and _wildcard_index_cache is not None and (now - _wildcard_index_time) < 60:
+        return _wildcard_index_cache
+
+    print(f"[MrWeaz Prompt Studio] Indexing wildcards...")
     index = {}
     for wdir in _get_wildcard_dirs():
         if not os.path.isdir(wdir):
@@ -49,6 +60,9 @@ def _build_wildcard_index():
                         key = key[:-4]
                     if key not in index:
                         index[key] = os.path.join(root, fname)
+    
+    _wildcard_index_cache = index
+    _wildcard_index_time = now
     return index
 
 _wildcard_cache = {}
@@ -104,6 +118,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 LOG_FILE = os.path.join(DATA_DIR, "Prompt_Studio_Log.json")
 PRESET_FILE = os.path.join(DATA_DIR, "Prompt_Presets.json")
+LORA_CACHE_FILE = os.path.join(DATA_DIR, "Lora_Metadata_Cache.json")
 
 def _load_json(path):
     if os.path.exists(path):
@@ -213,18 +228,39 @@ async def api_get_loras(request):
     try:
         lora_files = folder_paths.get_filename_list("loras")
         
+        # In-memory fast cache
         if _LORAS_PAYLOAD_CACHE is not None and _LORAS_LIST_CACHE == lora_files:
             return web.json_response({"loras": _LORAS_PAYLOAD_CACHE})
             
+        print(f"[MrWeaz Prompt Studio] Scanning LoRA metadata (optimized)...")
+        # Load persistent cache
+        persistent_cache = {}
+        if os.path.exists(LORA_CACHE_FILE):
+             try:
+                 with open(LORA_CACHE_FILE, "r", encoding="utf-8") as f:
+                     persistent_cache = json.load(f)
+             except: pass
+        
         loras_data = []
+        cache_updated = False
+        
         for lora in lora_files:
             lora_path = folder_paths.get_full_path("loras", lora)
             if not lora_path: continue
             
+            # Check if cache is still valid
+            mtime = os.path.getmtime(lora_path)
+            cached_entry = persistent_cache.get(lora)
+            
+            if cached_entry and cached_entry.get("mtime") == mtime:
+                loras_data.append(cached_entry)
+                continue
+            
+            # Cache miss or stale: full scan
+            cache_updated = True
             trigger_words = extract_trigger_words(lora_path)
             preview_url = _get_preview_url(lora)
             
-            # Check for Civitai info json for remote images or metadata
             civitai_image = ""
             civitai_desc = ""
             civitai_url = ""
@@ -240,7 +276,6 @@ async def api_get_loras(request):
                         if "images" in info and isinstance(info["images"], list) and len(info["images"]) > 0:
                             civitai_image = info["images"][0].get("url", "")
                         if "description" in info and info["description"]:
-                            # Clean HTML tags
                             import re
                             desc = re.sub(r'<[^>]+>', '', info["description"])
                             civitai_desc = desc[:250] + "..." if len(desc) > 250 else desc
@@ -255,18 +290,26 @@ async def api_get_loras(request):
             
             final_preview = preview_url if preview_url else civitai_image
             
-            loras_data.append({
+            entry = {
                 "name": lora,
                 "trigger_words": trigger_words,
                 "preview_url": final_preview,
                 "description": civitai_desc,
-                "civitai_url": civitai_url
-            })
+                "civitai_url": civitai_url,
+                "mtime": mtime # For cache validation
+            }
+            loras_data.append(entry)
+            persistent_cache[lora] = entry
         
+        if cache_updated:
+            _save_json(LORA_CACHE_FILE, persistent_cache)
+            
         _LORAS_PAYLOAD_CACHE = loras_data
         _LORAS_LIST_CACHE = lora_files
         return web.json_response({"loras": loras_data})
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return web.json_response({"error": str(e)}, status=500)
 
 import hashlib
