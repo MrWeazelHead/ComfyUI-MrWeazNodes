@@ -5,6 +5,8 @@ import torch.nn.functional as F
 import hashlib
 import json
 import os
+import math
+import fnmatch
 import numpy as np
 import nodes
 import comfy.samplers
@@ -16,10 +18,10 @@ from comfy.cli_args import args
 
 
 # ──────────────────────────────────────────────────────────────
-# Quick Edit Reference Loader
+# Klein Edit Passer Node
 # ──────────────────────────────────────────────────────────────
 
-class MrWeazKleinRefLoader:
+class MrWeazKleinEdit:
     """Loads an image directly on-node and prepares minimal Klein edit conditioning."""
 
     @classmethod
@@ -35,11 +37,14 @@ class MrWeazKleinRefLoader:
                         "control_after_refresh": "first",
                     },
                 }),
+                "edit_downscale_factor": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 1.0, "step": 0.05}),
+                "auto_fill_mask": ("BOOLEAN", {"default": False}),
+                "auto_expand_pixels": ("INT", {"default": 0, "min": 0, "max": 256, "step": 1}),
+                "auto_feather_radius": ("INT", {"default": 0, "min": 0, "max": 256, "step": 1}),
             },
             "optional": {
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
-                "edit_downscale_factor": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 1.0, "step": 0.05}),
             }
         }
 
@@ -52,11 +57,24 @@ class MrWeazKleinRefLoader:
         self,
         vae,
         upload_image,
+        edit_downscale_factor=1.0,
+        auto_fill_mask=False,
+        auto_expand_pixels=0,
+        auto_feather_radius=0,
         positive=None,
         negative=None,
-        edit_downscale_factor=1.0,
     ):
         image, mask = nodes.LoadImage().load_image(upload_image)
+        if edit_downscale_factor is None:
+            edit_downscale_factor = 1.0
+        try:
+            edit_downscale_factor = float(edit_downscale_factor)
+        except (TypeError, ValueError):
+            edit_downscale_factor = 1.0
+        if not math.isfinite(edit_downscale_factor):
+            edit_downscale_factor = 1.0
+        edit_downscale_factor = max(0.25, min(1.0, edit_downscale_factor))
+
         if edit_downscale_factor < 1.0:
             scaled_width = max(16, int((image.shape[2] * edit_downscale_factor) // 8) * 8)
             scaled_height = max(16, int((image.shape[1] * edit_downscale_factor) // 8) * 8)
@@ -86,6 +104,7 @@ class MrWeazKleinRefLoader:
         if mask is not None and torch.count_nonzero(mask) > 0:
             if mask.dim() == 2:
                 mask = mask.unsqueeze(0)
+            mask = self._process_mask(mask, auto_fill_mask, auto_expand_pixels, auto_feather_radius)
         else:
             mask = None
 
@@ -146,111 +165,49 @@ class MrWeazKleinRefLoader:
 
         return (result, positive, negative, image, preview_mask)
 
+    @staticmethod
+    def _process_mask(mask, fill_mask, expand_pixels, feather_radius):
+        result = mask.clone()
+
+        if fill_mask:
+            result = (result > 0).to(result.dtype)
+
+        if expand_pixels > 0:
+            kernel_size = expand_pixels * 2 + 1
+            result = result.unsqueeze(1)
+            result = F.max_pool2d(result, kernel_size=kernel_size, stride=1, padding=expand_pixels)
+            result = result.squeeze(1)
+
+        if feather_radius > 0:
+            kernel_size = feather_radius * 2 + 1
+            sigma = feather_radius / 3.0
+            x = torch.arange(kernel_size, dtype=torch.float32, device=result.device) - feather_radius
+            gauss_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+            gauss_1d = gauss_1d / gauss_1d.sum()
+
+            result = result.unsqueeze(1)
+
+            k_h = gauss_1d.view(1, 1, 1, kernel_size)
+            result = F.pad(result, (feather_radius, feather_radius, 0, 0), mode='replicate')
+            result = F.conv2d(result, k_h)
+
+            k_v = gauss_1d.view(1, 1, kernel_size, 1)
+            result = F.pad(result, (0, 0, feather_radius, feather_radius), mode='replicate')
+            result = F.conv2d(result, k_v)
+
+            result = result.squeeze(1)
+
+        return torch.clamp(result, 0.0, 1.0)
+
     @classmethod
-    def IS_CHANGED(s, vae, upload_image, positive=None, negative=None):
+    def IS_CHANGED(s, vae, upload_image, edit_downscale_factor=1.0, auto_fill_mask=False, auto_expand_pixels=0, auto_feather_radius=0, positive=None, negative=None):
         image_path = folder_paths.get_annotated_filepath(upload_image)
         if os.path.exists(image_path):
             return os.path.getmtime(image_path)
         return ""
 
     @classmethod
-    def VALIDATE_INPUTS(s, vae, upload_image, positive=None, negative=None):
-        if not folder_paths.exists_annotated_filepath(upload_image):
-            return "Invalid image file: {}".format(upload_image)
-        return True
-
-
-class MrWeazImageReference:
-    """Single-node version of the working Klein reference chain: scale, encode, reference-condition."""
-
-    @staticmethod
-    def _append_reference_latent(conditioning, ref_latent):
-        conditioning = node_helpers.conditioning_set_values(
-            conditioning,
-            {"reference_latents": [ref_latent]},
-            append=True,
-        )
-        return node_helpers.conditioning_set_values(
-            conditioning,
-            {"reference_latents_method": "offset"},
-        )
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "positive": ("CONDITIONING",),
-                "negative": ("CONDITIONING",),
-                "vae": ("VAE",),
-                "upload_image": ("COMBO", {
-                    "image_upload": True,
-                    "image_folder": "input",
-                    "remote": {
-                        "route": "/internal/files/input",
-                        "control_after_refresh": "first",
-                    },
-                }),
-            },
-            "optional": {
-                "upscale_method": (["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], {"default": "nearest-exact"}),
-                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 16.0, "step": 0.01}),
-                "resolution_steps": ("INT", {"default": 1, "min": 1, "max": 256, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "IMAGE")
-    RETURN_NAMES = ("positive", "negative", "preview_image")
-    FUNCTION = "apply_reference"
-    CATEGORY = "MrWeazNodes/Klein"
-
-    def apply_reference(
-        self,
-        positive,
-        negative,
-        vae,
-        upload_image,
-        upscale_method="nearest-exact",
-        megapixels=1.0,
-        resolution_steps=1,
-    ):
-        image, _ = nodes.LoadImage().load_image(upload_image)
-        samples = image[:, :, :, :3].movedim(-1, 1)
-        total = megapixels * 1024 * 1024
-        scale_by = math.sqrt(total / (samples.shape[3] * samples.shape[2]))
-        width = round(samples.shape[3] * scale_by / resolution_steps) * resolution_steps
-        height = round(samples.shape[2] * scale_by / resolution_steps) * resolution_steps
-        scaled = comfy.utils.common_upscale(samples, int(width), int(height), upscale_method, "disabled").movedim(1, -1)
-        latent = vae.encode(scaled)
-        positive = self._append_reference_latent(positive, latent)
-        negative = self._append_reference_latent(negative, latent)
-        return (positive, negative, scaled)
-
-    @classmethod
-    def IS_CHANGED(
-        s,
-        positive,
-        negative,
-        vae,
-        upload_image,
-        upscale_method="nearest-exact",
-        megapixels=1.0,
-        resolution_steps=1,
-    ):
-        image_path = folder_paths.get_annotated_filepath(upload_image)
-        mtime = os.path.getmtime(image_path) if os.path.exists(image_path) else ""
-        return f"{mtime}_{upscale_method}_{megapixels}_{resolution_steps}"
-
-    @classmethod
-    def VALIDATE_INPUTS(
-        s,
-        positive,
-        negative,
-        vae,
-        upload_image,
-        upscale_method="nearest-exact",
-        megapixels=1.0,
-        resolution_steps=1,
-    ):
+    def VALIDATE_INPUTS(s, vae, upload_image, edit_downscale_factor=1.0, auto_fill_mask=False, auto_expand_pixels=0, auto_feather_radius=0, positive=None, negative=None):
         if not folder_paths.exists_annotated_filepath(upload_image):
             return "Invalid image file: {}".format(upload_image)
         return True
@@ -260,6 +217,7 @@ class MrWeazImageReference:
 # ──────────────────────────────────────────────────────────────
 
 class MrWeazPromptBlender:
+    """Quick & easy prompt creator."""
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -290,6 +248,7 @@ class MrWeazPromptBlender:
 # ──────────────────────────────────────────────────────────────
 
 class MrWeazGridStitcher:
+    """Stitches two images together, useful for creating A/B comparisons."""
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -343,6 +302,7 @@ class MrWeazMaskFeatherExpand:
         return {
             "required": {
                 "mask": ("MASK",),
+                "fill_mask": ("BOOLEAN", {"default": False}),
                 "expand_pixels": ("INT", {"default": 8, "min": 0, "max": 256, "step": 1}),
                 "feather_radius": ("INT", {"default": 16, "min": 0, "max": 256, "step": 1}),
             }
@@ -353,11 +313,14 @@ class MrWeazMaskFeatherExpand:
     FUNCTION = "process"
     CATEGORY = "MrWeazNodes/Klein"
 
-    def process(self, mask, expand_pixels, feather_radius):
+    def process(self, mask, fill_mask, expand_pixels, feather_radius):
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
 
         result = mask.clone()
+
+        if fill_mask:
+            result = (result > 0).to(result.dtype)
 
         # 1. Dilation (expand)
         if expand_pixels > 0:
@@ -622,28 +585,95 @@ class MrWeazImageComparer(nodes.PreviewImage):
 
         return result
 
+# ──────────────────────────────────────────────────────────────
+# Reference Latent 
+# ──────────────────────────────────────────────────────────────
 
 
+class MrWeazReferenceFromImage:
+    """Reference encode and conditioning in one node."""
+    @classmethod
+    def _list_input_images(cls):
+        input_dir = folder_paths.get_input_directory()
+        exclude_files = {"Thumbs.db", "*.DS_Store", "desktop.ini", "*.lock"}
+        exclude_folders = {"clipspace", ".*"}
 
+        file_list = []
+        for root, dirs, files in os.walk(input_dir, followlinks=True):
+            dirs[:] = [d for d in dirs if not any(fnmatch.fnmatch(d, pat) for pat in exclude_folders)]
+            files = [f for f in files if not any(fnmatch.fnmatch(f, pat) for pat in exclude_files)]
+            for file in files:
+                relpath = os.path.relpath(os.path.join(root, file), start=input_dir)
+                file_list.append(relpath.replace("\\", "/"))
+        return sorted(file_list)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vae": ("VAE",),
+                "positive": ("CONDITIONING",),
+                "upload_image": (cls._list_input_images(), {"image_upload": True}),
+            },
+            "optional": {
+                "negative": ("CONDITIONING",),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "apply_reference"
+    CATEGORY = "MrWeazNodes/Conditioning"
+
+    @staticmethod
+    def _zero_conditioning(conditioning):
+        if conditioning is None:
+            return []
+
+        zeroed = []
+        for entry in conditioning:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                continue
+            cond_tensor = entry[0]
+            cond_meta = dict(entry[1]) if isinstance(entry[1], dict) else {}
+            cond_tensor = torch.zeros_like(cond_tensor)
+            pooled = cond_meta.get("pooled_output")
+            if pooled is not None:
+                cond_meta["pooled_output"] = torch.zeros_like(pooled)
+            zeroed.append([cond_tensor, cond_meta])
+        return zeroed
+
+    def apply_reference(self, positive, vae, upload_image, negative=None):
+        image, _mask = nodes.LoadImage().load_image(upload_image)
+        latent_samples = vae.encode(image[:, :, :, :3])
+        positive = node_helpers.conditioning_set_values(
+            positive,
+            {"reference_latents": [latent_samples]},
+            append=True,
+        )
+        negative = self._zero_conditioning(negative)
+        return (positive, negative)
 
 # ──────────────────────────────────────────────────────────────
 # Registration
 # ──────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
-    "MrWeazKleinRefLoader": MrWeazKleinRefLoader,
+    "MrWeazKleinEdit": MrWeazKleinEdit,
     "MrWeazMaskFeatherExpand": MrWeazMaskFeatherExpand,
     "MrWeazKleinBatchSeeds": MrWeazKleinBatchSeeds,
     "MrWeazPromptBlender": MrWeazPromptBlender,
     "MrWeazGridStitcher": MrWeazGridStitcher,
     "MrWeazImageComparer": MrWeazImageComparer,
+    "MrWeazReferenceFromImage": MrWeazReferenceFromImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MrWeazKleinRefLoader": "(MRW) Advanced Klein Edit",
+    "MrWeazKleinEdit": "(MRW) Klein Edit",
     "MrWeazMaskFeatherExpand": "(MRW) Mask Feather & Expand",
     "MrWeazKleinBatchSeeds": "(MRW) Batch Seed Runner",
     "MrWeazPromptBlender": "(MRW) Prompt Blender",
     "MrWeazGridStitcher": "(MRW) Reference Grid Stitcher",
-    "MrWeazImageComparer": "(MRW) Pro Image Comparer",
+    "MrWeazImageComparer": "(MRW) Image Comparer",
+    "MrWeazReferenceFromImage": "(MRW) Image Reference",
 }
