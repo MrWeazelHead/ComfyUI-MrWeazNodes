@@ -766,6 +766,189 @@ class MrWeazReferenceFromImage:
         negative = self._zero_conditioning(negative)
         return (positive, negative)
 
+
+def _normalize_conditioning(conditioning):
+    if conditioning is None:
+        return []
+    return conditioning
+
+
+def _extract_reference_latents(conditioning):
+    refs = []
+    for entry in conditioning or []:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        meta = entry[1] if isinstance(entry[1], dict) else {}
+        value = meta.get("reference_latents")
+        if isinstance(value, list):
+            refs.extend(value)
+    return refs
+
+
+def _extract_first_meta(conditioning, key):
+    for entry in conditioning or []:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        meta = entry[1] if isinstance(entry[1], dict) else {}
+        if key in meta:
+            return meta.get(key)
+    return None
+
+
+class MrWeazKleinContinuityController:
+    """Experimental continuity state controller for Klein conditioning."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "continuity_strength": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "style_freedom": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "identity_anchor": ("STRING", {"default": "", "multiline": True}),
+                "lock_identity": ("BOOLEAN", {"default": True}),
+                "keep_color_palette": ("BOOLEAN", {"default": True}),
+                "keep_outfit_props": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "negative": ("CONDITIONING",),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "STRING")
+    RETURN_NAMES = ("positive", "negative", "continuity_state")
+    FUNCTION = "apply_continuity"
+    CATEGORY = "MrWeazNodes/Klein/Experimental"
+
+    def apply_continuity(
+        self,
+        positive,
+        continuity_strength,
+        style_freedom,
+        identity_anchor,
+        lock_identity,
+        keep_color_palette,
+        keep_outfit_props,
+        negative=None,
+    ):
+        continuity_strength = max(0.0, min(1.0, float(continuity_strength)))
+        style_freedom = max(0.0, min(1.0, float(style_freedom)))
+
+        state = {
+            "continuity_strength": continuity_strength,
+            "style_freedom": style_freedom,
+            "identity_anchor": (identity_anchor or "").strip(),
+            "lock_identity": bool(lock_identity),
+            "keep_color_palette": bool(keep_color_palette),
+            "keep_outfit_props": bool(keep_outfit_props),
+            "version": 1,
+        }
+
+        positive = node_helpers.conditioning_set_values(positive, {"mrw_klein_continuity_state": state})
+        positive = node_helpers.conditioning_set_values(
+            positive,
+            {"mrw_klein_continuity_strength": continuity_strength},
+        )
+        positive = node_helpers.conditioning_set_values(
+            positive,
+            {"mrw_klein_style_freedom": style_freedom},
+        )
+
+        negative = _normalize_conditioning(negative)
+        if negative:
+            negative = node_helpers.conditioning_set_values(negative, {"mrw_klein_continuity_state": state})
+
+        return (positive, negative, json.dumps(state))
+
+
+class MrWeazKleinReferenceFusion:
+    """Experimental multi-reference fusion for Klein conditioning."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "fusion_mode": (["Balanced", "Identity Priority", "Style Priority", "Composition Priority"],),
+                "identity_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "style_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "composition_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+            },
+            "optional": {
+                "negative": ("CONDITIONING",),
+                "identity_reference": ("CONDITIONING",),
+                "style_reference": ("CONDITIONING",),
+                "composition_reference": ("CONDITIONING",),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "STRING")
+    RETURN_NAMES = ("positive", "negative", "fusion_report")
+    FUNCTION = "fuse_references"
+    CATEGORY = "MrWeazNodes/Klein/Experimental"
+
+    def fuse_references(
+        self,
+        positive,
+        fusion_mode,
+        identity_weight,
+        style_weight,
+        composition_weight,
+        negative=None,
+        identity_reference=None,
+        style_reference=None,
+        composition_reference=None,
+    ):
+        identity_weight = max(0.0, min(2.0, float(identity_weight)))
+        style_weight = max(0.0, min(2.0, float(style_weight)))
+        composition_weight = max(0.0, min(2.0, float(composition_weight)))
+
+        identity_refs = _extract_reference_latents(identity_reference)
+        style_refs = _extract_reference_latents(style_reference)
+        composition_refs = _extract_reference_latents(composition_reference)
+
+        fused_refs = []
+        fused_refs.extend(identity_refs)
+        fused_refs.extend(style_refs)
+        fused_refs.extend(composition_refs)
+
+        concat_latent = (
+            _extract_first_meta(identity_reference, "concat_latent_image")
+            or _extract_first_meta(style_reference, "concat_latent_image")
+            or _extract_first_meta(composition_reference, "concat_latent_image")
+        )
+        concat_mask = (
+            _extract_first_meta(identity_reference, "concat_mask")
+            or _extract_first_meta(style_reference, "concat_mask")
+            or _extract_first_meta(composition_reference, "concat_mask")
+        )
+
+        fusion_state = {
+            "fusion_mode": fusion_mode,
+            "identity_weight": identity_weight,
+            "style_weight": style_weight,
+            "composition_weight": composition_weight,
+            "identity_refs": len(identity_refs),
+            "style_refs": len(style_refs),
+            "composition_refs": len(composition_refs),
+            "fused_refs": len(fused_refs),
+            "version": 1,
+        }
+
+        positive = node_helpers.conditioning_set_values(positive, {"mrw_klein_fusion_state": fusion_state})
+        if fused_refs:
+            positive = node_helpers.conditioning_set_values(positive, {"reference_latents": fused_refs}, append=True)
+        if concat_latent is not None:
+            positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": concat_latent})
+        if concat_mask is not None:
+            positive = node_helpers.conditioning_set_values(positive, {"concat_mask": concat_mask})
+
+        negative = _normalize_conditioning(negative)
+        if negative:
+            negative = node_helpers.conditioning_set_values(negative, {"mrw_klein_fusion_state": fusion_state})
+
+        return (positive, negative, json.dumps(fusion_state))
+
 # ──────────────────────────────────────────────────────────────
 # Registration
 # ──────────────────────────────────────────────────────────────
@@ -778,6 +961,8 @@ NODE_CLASS_MAPPINGS = {
     "MrWeazGridStitcher": MrWeazGridStitcher,
     "MrWeazImageComparer": MrWeazImageComparer,
     "MrWeazReferenceFromImage": MrWeazReferenceFromImage,
+    "MrWeazKleinContinuityController": MrWeazKleinContinuityController,
+    "MrWeazKleinReferenceFusion": MrWeazKleinReferenceFusion,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -788,4 +973,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MrWeazGridStitcher": "(MRW) Reference Grid Stitcher",
     "MrWeazImageComparer": "(MRW) Image Comparer",
     "MrWeazReferenceFromImage": "(MRW) Image Reference",
+    "MrWeazKleinContinuityController": "(MRW) Klein Continuity Controller",
+    "MrWeazKleinReferenceFusion": "(MRW) Klein Reference Fusion",
 }
