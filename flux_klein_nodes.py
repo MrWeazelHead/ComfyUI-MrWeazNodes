@@ -418,13 +418,118 @@ class MrWeazImageComparer(nodes.PreviewImage):
         return full_output
 
     @staticmethod
-    def _build_metadata(prompt, extra_pnginfo, include_metadata, compare_meta=None):
+    def _extract_node(prompt, node_ref):
+        if not isinstance(prompt, dict):
+            return None
+        node_id = node_ref
+        if isinstance(node_ref, (list, tuple)) and len(node_ref) > 0:
+            node_id = node_ref[0]
+        if node_id is None:
+            return None
+        return prompt.get(str(node_id)) or prompt.get(node_id)
+
+    @classmethod
+    def _resolve_text_from_link(cls, prompt, node_ref, depth=0):
+        if depth > 8:
+            return None
+        node = cls._extract_node(prompt, node_ref)
+        if not isinstance(node, dict):
+            return None
+        node_type = str(node.get("class_type", ""))
+        inputs = node.get("inputs", {}) if isinstance(node.get("inputs", {}), dict) else {}
+
+        if "CLIPTextEncode" in node_type:
+            text = inputs.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+            return None
+
+        for key in ("conditioning", "conditioning_to", "conditioning_from", "positive", "negative"):
+            if key in inputs:
+                txt = cls._resolve_text_from_link(prompt, inputs.get(key), depth + 1)
+                if txt:
+                    return txt
+        return None
+
+    @classmethod
+    def _find_sampler_node(cls, prompt):
+        if not isinstance(prompt, dict):
+            return None
+        sampler_ids = []
+        for node_id, node in prompt.items():
+            if not isinstance(node, dict):
+                continue
+            node_type = str(node.get("class_type", ""))
+            if node_type in ("KSampler", "KSamplerAdvanced"):
+                try:
+                    sampler_ids.append((int(node_id), node))
+                except Exception:
+                    sampler_ids.append((-1, node))
+        if not sampler_ids:
+            return None
+        sampler_ids.sort(key=lambda x: x[0], reverse=True)
+        return sampler_ids[0][1]
+
+    @classmethod
+    def _build_parameters_text(cls, prompt, image_size=None):
+        sampler = cls._find_sampler_node(prompt)
+        if sampler is None:
+            return None
+
+        inputs = sampler.get("inputs", {}) if isinstance(sampler.get("inputs", {}), dict) else {}
+        steps = inputs.get("steps")
+        cfg = inputs.get("cfg")
+        sampler_name = inputs.get("sampler_name")
+        scheduler = inputs.get("scheduler")
+        seed = inputs.get("seed")
+        denoise = inputs.get("denoise")
+
+        positive_text = cls._resolve_text_from_link(prompt, inputs.get("positive"))
+        negative_text = cls._resolve_text_from_link(prompt, inputs.get("negative"))
+
+        lines = []
+        if positive_text:
+            lines.append(positive_text)
+        if negative_text:
+            lines.append(f"Negative prompt: {negative_text}")
+
+        param_parts = []
+        if steps is not None:
+            param_parts.append(f"Steps: {steps}")
+        if sampler_name is not None:
+            if scheduler is not None:
+                param_parts.append(f"Sampler: {sampler_name} ({scheduler})")
+            else:
+                param_parts.append(f"Sampler: {sampler_name}")
+        elif scheduler is not None:
+            param_parts.append(f"Scheduler: {scheduler}")
+        if cfg is not None:
+            param_parts.append(f"CFG scale: {cfg}")
+        if seed is not None:
+            param_parts.append(f"Seed: {seed}")
+        if denoise is not None:
+            param_parts.append(f"Denoise: {denoise}")
+        if image_size is not None and len(image_size) == 2:
+            param_parts.append(f"Size: {image_size[0]}x{image_size[1]}")
+
+        if param_parts:
+            lines.append(", ".join(param_parts))
+
+        if not lines:
+            return None
+        return "\n".join(lines)
+
+    @classmethod
+    def _build_metadata(cls, prompt, extra_pnginfo, include_metadata, compare_meta=None, image_size=None):
         if not include_metadata or args.disable_metadata:
             return None
 
         metadata = PngInfo()
         if prompt is not None:
             metadata.add_text("prompt", json.dumps(prompt))
+            parameters = cls._build_parameters_text(prompt, image_size=image_size)
+            if parameters:
+                metadata.add_text("parameters", parameters)
         if extra_pnginfo is not None:
             for key in extra_pnginfo:
                 metadata.add_text(key, json.dumps(extra_pnginfo[key]))
@@ -443,7 +548,14 @@ class MrWeazImageComparer(nodes.PreviewImage):
         for batch_number, image in enumerate(images):
             arr = 255.0 * image.cpu().numpy()
             img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-            metadata = self._build_metadata(prompt, extra_pnginfo, include_metadata, compare_meta=compare_meta)
+            image_size = (int(image.shape[1]), int(image.shape[0]))
+            metadata = self._build_metadata(
+                prompt,
+                extra_pnginfo,
+                include_metadata,
+                compare_meta=compare_meta,
+                image_size=image_size,
+            )
             filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
             file = f"{filename_with_batch_num}_{counter:05}_.png"
             img.save(os.path.join(full_output_folder, file), pnginfo=metadata, compress_level=self.compress_level)
@@ -491,7 +603,7 @@ class MrWeazImageComparer(nodes.PreviewImage):
     def INPUT_TYPES(s):
         return {
             "required": {
-                "enable_persistent_save": ("BOOLEAN", {"default": False}),
+                "save_image": ("BOOLEAN", {"default": True}),
                 "filename_prefix": ("STRING", {"default": "mrweaz/compare"}),
                 "custom_subfolder": ("STRING", {"default": "mrweaz_compare"}),
                 "save_image_a": ("BOOLEAN", {"default": True}),
@@ -517,7 +629,7 @@ class MrWeazImageComparer(nodes.PreviewImage):
 
     def compare_images(
         self,
-        enable_persistent_save,
+        save_image,
         filename_prefix,
         custom_subfolder,
         save_image_a,
@@ -542,7 +654,7 @@ class MrWeazImageComparer(nodes.PreviewImage):
             saved_b = self.save_images(image_b, filename_prefix="mrweaz.compare.b", prompt=prompt, extra_pnginfo=extra_pnginfo)
             result["ui"]["b_images"] = saved_b["ui"]["images"]
 
-        if enable_persistent_save and (image_a is not None or image_b is not None):
+        if save_image and (image_a is not None or image_b is not None):
             compare_meta = {
                 "comparer_node": "MrWeazImageComparer",
                 "stitched_layout": stitched_layout,
