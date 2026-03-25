@@ -29,6 +29,21 @@ A unified post-processing powerhouse that consolidates dozens of effects into a 
 - **Effects Library**: Includes Gaussian Blur, Sharpen, Sepia, Edge Detection, CRT/VHS (with radial aberration), Halftone, Bloom, Tilt-Shift, Glitch, and many more.
 - **Performance Optimized**: Built using efficient PyTorch operations for fast inference.
 
+### 🎯 Reference Images, Fusion & Consistency
+These new Klein workflow nodes are designed to keep edits controlled while giving you more creative flexibility across single or multi-reference setups.
+
+- **(MRW) Image Reference**: Loads an uploaded image, VAE-encodes it to latent, and injects it directly into positive conditioning as reference_latents. This makes reference-driven edits faster and cleaner, with no manual latent prep.
+- **(MRW) Klein Reference Fusion**: Combines multiple reference conditionings into one fused stream with role-based inputs:
+		identity_reference for subject fidelity
+		style_reference for look/finish
+		composition_reference for framing/layout
+		Includes weighted controls (identity/style/composition) plus fusion modes like Balanced, Identity Priority, Style Priority, and Composition Priority.
+- **(MRW) Klein Continuity Controller (Consistency Node)**: Adds a continuity state for cross-image consistency in iterative edits. Controls include:
+		continuity_strength (how strongly to preserve continuity)
+		style_freedom (how much visual variation is allowed)
+		identity_anchor (text anchor for character/object identity)
+		toggles for locking identity, palette retention, and outfit/prop retention
+
 ---
 
 ## ⚡ Flux Klein QoL Suite
