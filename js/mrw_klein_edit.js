@@ -13,7 +13,7 @@ function hideWidget(widget) {
 app.registerExtension({
     name: "MrWeaz.KleinEditCleanup",
     async nodeCreated(node) {
-        if (node.comfyClass !== "MrWeazKleinRefLoader" && node.comfyClass !== "MrWeazKleinReference2") return;
+        if (node.comfyClass !== "MrWeazKleinRefLoader") return;
 
         for (const widget of node.widgets || []) {
             const name = String(widget?.name || "").toLowerCase();
