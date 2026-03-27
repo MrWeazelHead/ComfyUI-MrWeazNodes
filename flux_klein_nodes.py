@@ -795,6 +795,71 @@ def _extract_first_meta(conditioning, key):
     return None
 
 
+def _fusion_mode_multipliers(fusion_mode):
+    if fusion_mode == "Identity Priority":
+        return {"identity": 1.35, "style": 0.8, "composition": 0.85}
+    if fusion_mode == "Style Priority":
+        return {"identity": 0.8, "style": 1.35, "composition": 0.85}
+    if fusion_mode == "Composition Priority":
+        return {"identity": 0.85, "style": 0.8, "composition": 1.35}
+    return {"identity": 1.0, "style": 1.0, "composition": 1.0}
+
+
+def _effective_fusion_weight(base_weight, fusion_mode, role):
+    multipliers = _fusion_mode_multipliers(fusion_mode)
+    return max(0.0, float(base_weight) * float(multipliers.get(role, 1.0)))
+
+
+def _weighted_reference_latents(refs, effective_weight):
+    if not refs or effective_weight <= 0.0:
+        return []
+    # Repeat references based on effective weight so downstream consumers receive a
+    # practical bias without requiring custom sampler support.
+    repeat_count = int(round(effective_weight * 4.0))
+    repeat_count = max(1, min(8, repeat_count))
+    weighted = []
+    for _ in range(repeat_count):
+        weighted.extend(refs)
+    return weighted
+
+
+def _pick_primary_conditioning_source(fusion_mode, role_data):
+    # role_data: {role: {"conditioning": ..., "effective_weight": ..., "refs": ...}}
+    available = []
+    for role, data in role_data.items():
+        conditioning = data.get("conditioning")
+        if conditioning is None:
+            continue
+        concat_latent = _extract_first_meta(conditioning, "concat_latent_image")
+        concat_mask = _extract_first_meta(conditioning, "concat_mask")
+        if concat_latent is None and concat_mask is None:
+            continue
+        available.append({
+            "role": role,
+            "conditioning": conditioning,
+            "effective_weight": float(data.get("effective_weight", 0.0)),
+            "concat_latent": concat_latent,
+            "concat_mask": concat_mask,
+        })
+
+    if not available:
+        return (None, None, None)
+
+    # Tie-break order follows the chosen fusion mode.
+    if fusion_mode == "Identity Priority":
+        order = {"identity": 0, "style": 1, "composition": 2}
+    elif fusion_mode == "Style Priority":
+        order = {"style": 0, "identity": 1, "composition": 2}
+    elif fusion_mode == "Composition Priority":
+        order = {"composition": 0, "identity": 1, "style": 2}
+    else:
+        order = {"identity": 0, "style": 1, "composition": 2}
+
+    available.sort(key=lambda x: (-x["effective_weight"], order.get(x["role"], 99)))
+    chosen = available[0]
+    return (chosen["concat_latent"], chosen["concat_mask"], chosen["role"])
+
+
 class MrWeazKleinContinuityController:
     """Experimental continuity state controller for Klein conditioning."""
 
@@ -907,31 +972,51 @@ class MrWeazKleinReferenceFusion:
         style_refs = _extract_reference_latents(style_reference)
         composition_refs = _extract_reference_latents(composition_reference)
 
-        fused_refs = []
-        fused_refs.extend(identity_refs)
-        fused_refs.extend(style_refs)
-        fused_refs.extend(composition_refs)
+        effective_identity_weight = _effective_fusion_weight(identity_weight, fusion_mode, "identity")
+        effective_style_weight = _effective_fusion_weight(style_weight, fusion_mode, "style")
+        effective_composition_weight = _effective_fusion_weight(composition_weight, fusion_mode, "composition")
 
-        concat_latent = (
-            _extract_first_meta(identity_reference, "concat_latent_image")
-            or _extract_first_meta(style_reference, "concat_latent_image")
-            or _extract_first_meta(composition_reference, "concat_latent_image")
-        )
-        concat_mask = (
-            _extract_first_meta(identity_reference, "concat_mask")
-            or _extract_first_meta(style_reference, "concat_mask")
-            or _extract_first_meta(composition_reference, "concat_mask")
-        )
+        fused_refs = []
+        fused_refs.extend(_weighted_reference_latents(identity_refs, effective_identity_weight))
+        fused_refs.extend(_weighted_reference_latents(style_refs, effective_style_weight))
+        fused_refs.extend(_weighted_reference_latents(composition_refs, effective_composition_weight))
+
+        role_data = {
+            "identity": {
+                "conditioning": identity_reference,
+                "effective_weight": effective_identity_weight,
+                "refs": identity_refs,
+            },
+            "style": {
+                "conditioning": style_reference,
+                "effective_weight": effective_style_weight,
+                "refs": style_refs,
+            },
+            "composition": {
+                "conditioning": composition_reference,
+                "effective_weight": effective_composition_weight,
+                "refs": composition_refs,
+            },
+        }
+
+        concat_latent, concat_mask, primary_source = _pick_primary_conditioning_source(fusion_mode, role_data)
 
         fusion_state = {
             "fusion_mode": fusion_mode,
             "identity_weight": identity_weight,
             "style_weight": style_weight,
             "composition_weight": composition_weight,
+            "effective_identity_weight": effective_identity_weight,
+            "effective_style_weight": effective_style_weight,
+            "effective_composition_weight": effective_composition_weight,
             "identity_refs": len(identity_refs),
             "style_refs": len(style_refs),
             "composition_refs": len(composition_refs),
+            "weighted_identity_refs": len(_weighted_reference_latents(identity_refs, effective_identity_weight)),
+            "weighted_style_refs": len(_weighted_reference_latents(style_refs, effective_style_weight)),
+            "weighted_composition_refs": len(_weighted_reference_latents(composition_refs, effective_composition_weight)),
             "fused_refs": len(fused_refs),
+            "primary_source": primary_source,
             "version": 1,
         }
 
