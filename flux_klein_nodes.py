@@ -795,6 +795,156 @@ def _extract_first_meta(conditioning, key):
     return None
 
 
+def _clone_conditioning(conditioning):
+    cloned = []
+    for entry in conditioning or []:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        cond_tensor = entry[0]
+        cond_meta = dict(entry[1]) if isinstance(entry[1], dict) else {}
+        cloned.append([cond_tensor, cond_meta])
+    return cloned
+
+
+def _conditioning_set_mask(conditioning, mask, strength, set_area_to_bounds):
+    conditioned = []
+    for entry in conditioning or []:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        cond_tensor = entry[0]
+        cond_meta = dict(entry[1]) if isinstance(entry[1], dict) else {}
+        cond_meta["mask"] = mask
+        cond_meta["mask_strength"] = float(strength)
+        cond_meta["set_area_to_bounds"] = bool(set_area_to_bounds)
+        conditioned.append([cond_tensor, cond_meta])
+    return conditioned
+
+
+class MrWeazRegionalPromptMixer:
+    """Mixes regional prompt conditionings using masks with per-region strength."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "set_area_to_bounds": ("BOOLEAN", {"default": True}),
+                "feather_radius": ("INT", {"default": 12, "min": 0, "max": 256, "step": 1}),
+                "region_1_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "region_2_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "region_3_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+            },
+            "optional": {
+                "negative": ("CONDITIONING",),
+                "region_1_positive": ("CONDITIONING",),
+                "region_1_mask": ("MASK",),
+                "region_2_positive": ("CONDITIONING",),
+                "region_2_mask": ("MASK",),
+                "region_3_positive": ("CONDITIONING",),
+                "region_3_mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "STRING")
+    RETURN_NAMES = ("positive", "negative", "mix_report")
+    FUNCTION = "mix"
+    CATEGORY = "MrWeazNodes/Conditioning"
+
+    @staticmethod
+    def _prepare_mask(mask, feather_radius):
+        if mask is None:
+            return None
+
+        m = mask
+        if m.dim() == 2:
+            m = m.unsqueeze(0)
+        elif m.dim() == 4 and m.shape[-1] == 1:
+            m = m.squeeze(-1)
+        elif m.dim() == 4 and m.shape[1] == 1:
+            m = m.squeeze(1)
+
+        if m.dim() != 3:
+            raise ValueError(f"Unsupported mask shape {tuple(m.shape)}; expected [B,H,W] or [H,W].")
+
+        m = torch.clamp(m, 0.0, 1.0)
+
+        if feather_radius <= 0:
+            return m
+
+        kernel_size = feather_radius * 2 + 1
+        sigma = max(0.001, feather_radius / 3.0)
+        x = torch.arange(kernel_size, dtype=torch.float32, device=m.device) - feather_radius
+        gauss_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+        gauss_1d = gauss_1d / gauss_1d.sum()
+
+        m = m.unsqueeze(1)
+        k_h = gauss_1d.view(1, 1, 1, kernel_size)
+        m = F.pad(m, (feather_radius, feather_radius, 0, 0), mode="replicate")
+        m = F.conv2d(m, k_h)
+
+        k_v = gauss_1d.view(1, 1, kernel_size, 1)
+        m = F.pad(m, (0, 0, feather_radius, feather_radius), mode="replicate")
+        m = F.conv2d(m, k_v)
+        m = m.squeeze(1)
+
+        return torch.clamp(m, 0.0, 1.0)
+
+    def mix(
+        self,
+        positive,
+        set_area_to_bounds,
+        feather_radius,
+        region_1_strength,
+        region_2_strength,
+        region_3_strength,
+        negative=None,
+        region_1_positive=None,
+        region_1_mask=None,
+        region_2_positive=None,
+        region_2_mask=None,
+        region_3_positive=None,
+        region_3_mask=None,
+    ):
+        mixed_positive = _clone_conditioning(positive)
+
+        regions = [
+            (1, region_1_positive, region_1_mask, float(region_1_strength)),
+            (2, region_2_positive, region_2_mask, float(region_2_strength)),
+            (3, region_3_positive, region_3_mask, float(region_3_strength)),
+        ]
+
+        applied_regions = []
+        for idx, region_positive, region_mask, region_strength in regions:
+            if region_positive is None or region_mask is None or region_strength <= 0.0:
+                continue
+            prepared_mask = self._prepare_mask(region_mask, int(feather_radius))
+            region_conditioning = _conditioning_set_mask(
+                _clone_conditioning(region_positive),
+                prepared_mask,
+                region_strength,
+                set_area_to_bounds,
+            )
+            if region_conditioning:
+                mixed_positive.extend(region_conditioning)
+                applied_regions.append({
+                    "region": idx,
+                    "strength": region_strength,
+                    "entries": len(region_conditioning),
+                })
+
+        mix_report = {
+            "base_entries": len(_clone_conditioning(positive)),
+            "applied_regions": applied_regions,
+            "total_positive_entries": len(mixed_positive),
+            "set_area_to_bounds": bool(set_area_to_bounds),
+            "feather_radius": int(feather_radius),
+            "version": 1,
+        }
+
+        negative = _normalize_conditioning(negative)
+        return (mixed_positive, negative, json.dumps(mix_report))
+
+
 def _fusion_mode_multipliers(fusion_mode):
     if fusion_mode == "Identity Priority":
         return {"identity": 1.35, "style": 0.8, "composition": 0.85}
@@ -1046,6 +1196,7 @@ NODE_CLASS_MAPPINGS = {
     "MrWeazGridStitcher": MrWeazGridStitcher,
     "MrWeazImageComparer": MrWeazImageComparer,
     "MrWeazReferenceFromImage": MrWeazReferenceFromImage,
+    "MrWeazRegionalPromptMixer": MrWeazRegionalPromptMixer,
     "MrWeazKleinContinuityController": MrWeazKleinContinuityController,
     "MrWeazKleinReferenceFusion": MrWeazKleinReferenceFusion,
 }
@@ -1058,6 +1209,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MrWeazGridStitcher": "(MRW) Reference Grid Stitcher",
     "MrWeazImageComparer": "(MRW) Image Comparer",
     "MrWeazReferenceFromImage": "(MRW) Image Reference",
+    "MrWeazRegionalPromptMixer": "(MRW) Regional Prompt Mixer",
     "MrWeazKleinContinuityController": "(MRW) Klein Continuity Controller",
     "MrWeazKleinReferenceFusion": "(MRW) Klein Reference Fusion",
 }
