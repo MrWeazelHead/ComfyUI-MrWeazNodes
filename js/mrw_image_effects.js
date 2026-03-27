@@ -40,6 +40,7 @@ class MrWeazImageEffectsWidget {
     }
 
     draw(ctx, node, width, y, widget_offset) {
+        ctx.save();
         const [nodeWidth, nodeHeight] = node.size;
         let currentY = y + 5; // Initial padding
 
@@ -96,7 +97,8 @@ class MrWeazImageEffectsWidget {
                 if (imgA && imgB) {
                     const splitX = offsetX + (targetW * this.sliderX);
                     
-                    // Outer Glow
+                    // Keep glow styles scoped so they don't bleed into standard widgets.
+                    ctx.save();
                     ctx.shadowBlur = 10;
                     ctx.shadowColor = "rgba(0, 255, 127, 0.5)";
                     ctx.strokeStyle = "#00ff7f";
@@ -106,8 +108,7 @@ class MrWeazImageEffectsWidget {
                     ctx.moveTo(splitX, offsetY);
                     ctx.lineTo(splitX, offsetY + targetH);
                     ctx.stroke();
-                    ctx.setLineDash([]);
-                    ctx.shadowBlur = 0;
+                    ctx.restore();
 
                     // Slider Handle
                     ctx.fillStyle = "#00ff7f";
@@ -143,6 +144,7 @@ class MrWeazImageEffectsWidget {
         ctx.font = "bold 13px Courier New";
         ctx.textAlign = "left";
         ctx.fillText(`🚀 [EFFECT]_${effectName.toUpperCase()}`, 25, currentY + 22);
+        ctx.restore();
     }
 
     computeSize(width) {
@@ -172,7 +174,14 @@ app.registerExtension({
                 "Letterbox": ["bar_ratio", "bar_color", "orientation"],
                 "ColorAdjust": ["brightness", "contrast", "saturation", "hue_shift"],
                 "VibeTransfer": ["intensity", "reference_image"],
-                "LensAberration": ["aberration_strength"]
+                "LensAberration": ["aberration_strength"],
+                "Pixelate": ["dot_size"],
+                "Solarize": ["threshold"],
+                "Duotone": ["highlight_color", "shadow_color", "intensity"],
+                "Emboss": ["strength", "angle"],
+                "VignetteOnly": ["vignette_intensity"],
+                "Gamma": ["brightness"],
+                "CrossProcess": ["intensity"]
             };
 
             // 1. Add Custom Comparison Widget at the TOP
