@@ -314,6 +314,44 @@ class MrWeazAIOImageEffects(nodes.PreviewImage):
     
     def __init__(self):
         super().__init__()
+
+    @staticmethod
+    def _prepare_mask(mask, image):
+        """
+        Normalize incoming MASK tensor to shape [B, H, W, 1] matching IMAGE batch/size.
+        """
+        if mask is None:
+            return None
+
+        m = mask
+        # Comfy masks are usually [B,H,W], but handle common variants defensively.
+        if m.dim() == 2:
+            m = m.unsqueeze(0)
+        elif m.dim() == 4 and m.shape[-1] == 1:
+            m = m.squeeze(-1)
+        elif m.dim() == 4 and m.shape[1] == 1:
+            m = m.squeeze(1)
+
+        if m.dim() != 3:
+            raise ValueError(f"Unsupported mask shape {tuple(m.shape)}; expected [B,H,W] or [H,W].")
+
+        m = m.to(device=image.device, dtype=image.dtype)
+
+        b, h, w, _ = image.shape
+        mb = m.shape[0]
+        if mb == 1 and b > 1:
+            m = m.expand(b, -1, -1)
+        elif mb != b:
+            if mb < b:
+                reps = math.ceil(b / mb)
+                m = m.repeat(reps, 1, 1)[:b]
+            else:
+                m = m[:b]
+
+        if m.shape[1] != h or m.shape[2] != w:
+            m = F.interpolate(m.unsqueeze(1), size=(h, w), mode='bilinear', align_corners=False).squeeze(1)
+
+        return torch.clamp(m, 0.0, 1.0).unsqueeze(-1)
     
     @classmethod
     def INPUT_TYPES(s):
@@ -325,7 +363,9 @@ class MrWeazAIOImageEffects(nodes.PreviewImage):
                     "GaussianBlur", "Sharpen", "Invert", "Sepia", "EdgeDetection",
                     "Glitch", "TiltShift", "Halftone", "Bloom", "SplitToning",
                     "CRTVHS", "FilmGrainVignette", "Posterize", "Letterbox",
-                    "ColorAdjust", "VibeTransfer", "LensAberration"
+                    "ColorAdjust", "VibeTransfer", "LensAberration",
+                    "Pixelate", "Solarize", "Duotone",
+                    "Emboss", "VignetteOnly", "Gamma", "CrossProcess"
                 ], {"default": "None"}),
                 
                 # Gaussian Blur / Bloom
@@ -391,6 +431,7 @@ class MrWeazAIOImageEffects(nodes.PreviewImage):
             },
             "optional": {
                 "reference_image": ("IMAGE",),
+                "mask": ("MASK",),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -443,6 +484,31 @@ class MrWeazAIOImageEffects(nodes.PreviewImage):
                 result_img = MrWeazVibeTransfer().process(image, ref, kwargs.get("intensity", 1.0))[0]
             elif effect == "LensAberration":
                 result_img = MrWeazLensAberration().process(image, kwargs.get("aberration_strength", 0.02))[0]
+            elif effect == "Pixelate":
+                result_img = MrWeazPixelate().process(image, kwargs.get("dot_size", 4))[0]
+            elif effect == "Solarize":
+                result_img = MrWeazSolarize().process(image, kwargs.get("threshold", 0.8))[0]
+            elif effect == "Duotone":
+                result_img = MrWeazDuotone().process(
+                    image,
+                    kwargs.get("highlight_color", "#FFCC00"),
+                    kwargs.get("shadow_color", "#003366"),
+                    kwargs.get("intensity", 1.0)
+                )[0]
+            elif effect == "Emboss":
+                result_img = MrWeazEmboss().process(image, kwargs.get("strength", 1.0), kwargs.get("angle", 45.0))[0]
+            elif effect == "VignetteOnly":
+                result_img = MrWeazVignetteOnly().process(image, kwargs.get("vignette_intensity", 0.3))[0]
+            elif effect == "Gamma":
+                result_img = MrWeazGamma().process(image, kwargs.get("brightness", 1.0))[0]
+            elif effect == "CrossProcess":
+                result_img = MrWeazCrossProcess().process(image, kwargs.get("intensity", 1.0))[0]
+
+        # Optional mask blending: apply effect only where mask is white.
+        mask = kwargs.get("mask", None)
+        if mask is not None:
+            mask_prepared = self._prepare_mask(mask, image)
+            result_img = torch.lerp(image, result_img, mask_prepared)
 
         # Save both for UI comparison
         saved_before = self.save_images(image, filename_prefix="mrweaz.aio.before", prompt=prompt, extra_pnginfo=extra_pnginfo)
@@ -588,7 +654,8 @@ class MrWeazTiltShift:
         blurred = F.avg_pool2d(F.pad(img_p, (blur_amount, blur_amount, blur_amount, blur_amount), mode='reflect'), k, stride=1)
         # Gradient mask
         h = image.shape[1]
-        y = torch.linspace(0, 1, h).view(1, h, 1, 1).to(image.device)
+        # img_p is B,C,H,W, so mask must be broadcastable as 1,1,H,1.
+        y = torch.linspace(0, 1, h, device=image.device).view(1, 1, h, 1)
         mask = torch.abs(y - focus_center) - (focus_width / 2)
         mask = torch.clamp(mask / (focus_width / 2), 0, 1) # 0 at focus, 1 at edges
         result = torch.lerp(img_p, blurred, mask)
@@ -667,6 +734,136 @@ class MrWeazSplitToning:
         toned_s = image * mask + (image * s_rgb) * (1.0 - mask)
         result = torch.lerp(toned_s, toned_h, mask)
         return (torch.clamp(result, 0, 1),)
+
+
+class MrWeazPixelate:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE",),
+            "block_size": ("INT", {"default": 4, "min": 1, "max": 64}),
+        }}
+    RETURN_TYPES = ("IMAGE",); FUNCTION = "process"; CATEGORY = "MrWeazNodes/Effects"
+    def process(self, image, block_size):
+        if block_size <= 1:
+            return (image,)
+        img = image.permute(0, 3, 1, 2)
+        _, _, h, w = img.shape
+        small_h = max(1, h // block_size)
+        small_w = max(1, w // block_size)
+        down = F.interpolate(img, size=(small_h, small_w), mode='nearest')
+        up = F.interpolate(down, size=(h, w), mode='nearest')
+        return (up.permute(0, 2, 3, 1),)
+
+
+class MrWeazSolarize:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE",),
+            "threshold": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
+        }}
+    RETURN_TYPES = ("IMAGE",); FUNCTION = "process"; CATEGORY = "MrWeazNodes/Effects"
+    def process(self, image, threshold):
+        t = float(torch.clamp(torch.tensor(threshold, device=image.device), 0.0, 1.0))
+        result = torch.where(image < t, image, 1.0 - image)
+        return (torch.clamp(result, 0.0, 1.0),)
+
+
+class MrWeazDuotone:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE",),
+            "highlight_color": ("COLOR", {"default": "#FFCC00"}),
+            "shadow_color": ("COLOR", {"default": "#003366"}),
+            "intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+        }}
+    RETURN_TYPES = ("IMAGE",); FUNCTION = "process"; CATEGORY = "MrWeazNodes/Effects"
+    def process(self, image, highlight_color, shadow_color, intensity):
+        def hex_to_rgb(h):
+            h = h.lstrip('#')
+            return torch.tensor([int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4)], device=image.device).view(1, 1, 1, 3)
+        hi = hex_to_rgb(highlight_color)
+        sh = hex_to_rgb(shadow_color)
+        luma = (0.299 * image[..., 0:1] + 0.587 * image[..., 1:2] + 0.114 * image[..., 2:3])
+        toned = sh + luma * (hi - sh)
+        result = torch.lerp(image, toned, intensity)
+        return (torch.clamp(result, 0.0, 1.0),)
+
+
+class MrWeazEmboss:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE",),
+            "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.05}),
+            "angle": ("FLOAT", {"default": 45.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+        }}
+    RETURN_TYPES = ("IMAGE",); FUNCTION = "process"; CATEGORY = "MrWeazNodes/Effects"
+    def process(self, image, strength, angle):
+        img = image.permute(0, 3, 1, 2)
+        # Directional gradient-based emboss from chosen angle.
+        rad = angle * (math.pi / 180.0)
+        dx = int(round(math.cos(rad)))
+        dy = int(round(math.sin(rad)))
+        shifted = torch.roll(img, shifts=(dy, dx), dims=(2, 3))
+        grad = img - shifted
+        embossed = torch.clamp(0.5 + grad * strength, 0.0, 1.0)
+        result = torch.lerp(img, embossed, min(max(strength / 2.0, 0.0), 1.0))
+        return (torch.clamp(result, 0.0, 1.0).permute(0, 2, 3, 1),)
+
+
+class MrWeazVignetteOnly:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE",),
+            "vignette_intensity": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05}),
+        }}
+    RETURN_TYPES = ("IMAGE",); FUNCTION = "process"; CATEGORY = "MrWeazNodes/Effects"
+    def process(self, image, vignette_intensity):
+        if vignette_intensity <= 0.0:
+            return (image,)
+        b, h, w, c = image.shape
+        y = torch.linspace(-1, 1, h, device=image.device).view(1, h, 1, 1)
+        x = torch.linspace(-1, 1, w, device=image.device).view(1, 1, w, 1)
+        radius = torch.sqrt(x**2 + y**2)
+        vignette = 1.0 - torch.clamp(radius * vignette_intensity, 0.0, 1.0)
+        return (torch.clamp(image * vignette, 0.0, 1.0),)
+
+
+class MrWeazGamma:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE",),
+            "brightness": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 3.0, "step": 0.05}),
+        }}
+    RETURN_TYPES = ("IMAGE",); FUNCTION = "process"; CATEGORY = "MrWeazNodes/Effects"
+    def process(self, image, brightness):
+        g = max(0.001, float(brightness))
+        corrected = torch.pow(torch.clamp(image, 0.0, 1.0), 1.0 / g)
+        return (torch.clamp(corrected, 0.0, 1.0),)
+
+
+class MrWeazCrossProcess:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE",),
+            "intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+        }}
+    RETURN_TYPES = ("IMAGE",); FUNCTION = "process"; CATEGORY = "MrWeazNodes/Effects"
+    def process(self, image, intensity):
+        i = float(min(max(intensity, 0.0), 1.0))
+        # Classic-ish cross-process curve: warmer highs, cooler shadows, contrast bump.
+        r = torch.clamp(image[..., 0:1] * 1.08 + 0.02, 0.0, 1.0)
+        g = torch.clamp(torch.pow(image[..., 1:2], 0.95), 0.0, 1.0)
+        b = torch.clamp(torch.pow(image[..., 2:3], 1.08) * 0.95, 0.0, 1.0)
+        xp = torch.cat([r, g, b], dim=-1)
+        result = torch.lerp(image, xp, i)
+        return (torch.clamp(result, 0.0, 1.0),)
 
 NODE_CLASS_MAPPINGS = {
     "MrWeazAIOImageEffects": MrWeazAIOImageEffects
