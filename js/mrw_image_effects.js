@@ -181,7 +181,11 @@ app.registerExtension({
                 "Emboss": ["strength", "angle"],
                 "VignetteOnly": ["vignette_intensity"],
                 "Gamma": ["brightness"],
-                "CrossProcess": ["intensity"]
+                "CrossProcess": ["intensity"],
+                "ChromaShift": ["rgb_shift_amount"],
+                "Sketch": ["sensitivity"],
+                "Vibrance": ["saturation", "intensity"],
+                "NightVision": ["intensity", "noise_amount"]
             };
 
             // 1. Add Custom Comparison Widget at the TOP
